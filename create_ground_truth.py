@@ -8,33 +8,6 @@ import json
 import sys
 import math
 import os
-import re
-
-def compact_json_dumps(obj, indent=2):
-    """
-    Custom JSON serialization that keeps arrays compact on single lines
-    while maintaining overall indentation for readability.
-    """
-    # First, dump with normal indentation
-    json_str = json.dumps(obj, indent=indent)
-
-    # Then compress arrays to single lines using regex
-    # This pattern matches arrays that span multiple lines
-    pattern = r'\[\s*\n\s*([^\[\]]*?)\s*\n\s*\]'
-
-    def compress_array(match):
-        # Extract the array content and compress to single line
-        content = match.group(1)
-        # Remove all whitespace and newlines, then add single spaces after commas
-        compressed = re.sub(r'\s+', ' ', content.strip())
-        compressed = re.sub(r'\s*,\s*', ', ', compressed)
-        return f'[{compressed}]'
-
-    # Apply the compression repeatedly until no more matches
-    while re.search(pattern, json_str, re.DOTALL):
-        json_str = re.sub(pattern, compress_array, json_str, flags=re.DOTALL)
-
-    return json_str
 
 def calculate_distance(gps_pos, detection):
     """Calculate 3D Euclidean distance between GPS position and detection."""
@@ -153,10 +126,10 @@ def main(session_dir=None):
         with open(output_file, 'w') as f:
             json.dump(ground_truth, f, indent=2)
 
-        # Save integrated file with compact JSON formatting if session directory provided
+        # Save integrated file if session directory provided
         if integrated_output_file:
             with open(integrated_output_file, 'w') as f:
-                f.write(compact_json_dumps(data, indent=2))
+                json.dump(data, f, indent=2)
 
         print(f"Ground truth labels saved to {output_file}")
         if integrated_output_file:

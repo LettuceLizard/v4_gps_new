@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# Check if session path argument is provided
+if [ $# -eq 0 ]; then
+    echo "Usage: ./postprocessing <session_path>"
+    echo "Example: ./postprocessing data/single_positive_rest_negative/"
+    exit 1
+fi
+
+SESSION_PATH="$1"
+
+# Check if the session path exists
+if [ ! -d "$SESSION_PATH" ]; then
+    echo "Error: Directory not found: $SESSION_PATH"
+    exit 1
+fi
+
+echo "Starting postprocessing pipeline for: $SESSION_PATH"
+echo "================================================"
+
+# Step 1: Convert data to JSON
+echo ""
+echo "Step 1: Converting data to JSON..."
+echo "----------------------------------"
+python convert_data_to_json.py "$SESSION_PATH"
+if [ $? -ne 0 ]; then
+    echo "Error: convert_data_to_json.py failed"
+    exit 1
+fi
+
+# Step 2: Post-process radar data
+echo ""
+echo "Step 2: Post-processing radar data..."
+echo "-------------------------------------"
+python post_process_radar_data.py "$SESSION_PATH"
+if [ $? -ne 0 ]; then
+    echo "Error: post_process_radar_data.py failed"
+    exit 1
+fi
+
+# Step 3: Create ground truth
+echo ""
+echo "Step 3: Creating ground truth labels..."
+echo "---------------------------------------"
+python create_ground_truth.py "$SESSION_PATH"
+if [ $? -ne 0 ]; then
+    echo "Error: create_ground_truth.py failed"
+    exit 1
+fi
+
+echo ""
+echo "================================================"
+echo "✅ Postprocessing pipeline completed successfully!"
+echo "Output files generated in: $SESSION_PATH"

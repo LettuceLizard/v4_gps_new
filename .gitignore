@@ -143,11 +143,15 @@ cython_debug/
 *.code-workspace
 
 # Machine Learning specific
-# Data
-data/
+# Data - ignore everything in data except post_processed files
+data/**/*
+!data/
+!data/*/
+!data/*/post_processed_with_ground_truth_data_*.json
 datasets/
 *.csv
 *.json
+!**/post_processed_with_ground_truth_data_*.json
 *.pkl
 *.pickle
 *.h5

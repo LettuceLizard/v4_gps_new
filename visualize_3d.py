@@ -8,13 +8,10 @@ Coordinate system: ENU (East-North-Up) with base station at origin (0,0,0)
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any
-import matplotlib.animation as animation
 from matplotlib.widgets import Slider, Button
-import time
 
 class Radar3DVisualizer:
     """Interactive 3D visualizer for radar objects and GPS trajectory"""

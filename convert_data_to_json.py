@@ -70,22 +70,6 @@ class DataConverter:
 
         return events
 
-    def get_summary(self) -> Dict:
-        """Get summary of events in binary files"""
-        events = self._read_binary_events()
-
-        # Count events by type
-        event_counts = {}
-        event_type_map = {v: k for k, v in self.metadata.get('event_types', {}).items()}
-
-        for event in events:
-            event_type_name = event_type_map.get(event['event_type_id'], f"unknown_{event['event_type_id']}")
-            event_counts[event_type_name] = event_counts.get(event_type_name, 0) + 1
-
-        return {
-            "event_counts": event_counts,
-            "session_metadata": self.metadata
-        }
 
     def convert_to_paired_json_files(self, include_raw_data=False) -> Dict:
         """Convert binary data to paired JSON files"""
@@ -165,15 +149,15 @@ class DataConverter:
                 num_objects = 0
                 objects = []
 
-            # Create synthetic base station data (fixed coordinates)
-            # These coordinates are used as reference point for ENU conversion
-            base_station_coords = {
-                "latitude": 56.18344621794,  # Fixed base station coordinates
-                "longitude": 15.59475587785,
-                "altitude": 41.2164,
-                "position_type": "NARROW_INT",
-                "timestamp": gps_data['timestamp'] - 0.001  # Slightly before rover
-            }
+            # Get base station coordinates from metadata
+            base_station_coords = self.metadata.get('base_station')
+            if not base_station_coords:
+                # Fallback to empty dict if not in metadata
+                base_station_coords = {}
+            else:
+                # Add dynamic timestamp
+                base_station_coords = base_station_coords.copy()
+                base_station_coords['timestamp'] = gps_data['timestamp'] - 0.001
 
             frame_data = {
                 "frame_number": frame_num,
@@ -215,10 +199,6 @@ if __name__ == "__main__":
     try:
         print(f"🔄 Converting radar data from: {session_path}")
         converter = DataConverter(session_path)
-
-        # Show summary first
-        summary = converter.get_summary()
-        print(f"📊 Event summary: {summary['event_counts']}")
 
         # Convert to JSON
         result = converter.convert_to_paired_json_files(include_raw_data=False)
