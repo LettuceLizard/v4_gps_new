@@ -23,6 +23,9 @@ from datetime import datetime
 from pathlib import Path
 from collections import deque
 import queue
+import signal
+import psutil
+import gc
 
 # --- ASCII Protocol Classes ---
 class ASCIIHEADER:
@@ -551,13 +554,26 @@ class GeneralTCPServer:
             print(f"[{timestamp}] {message}")
 
     def receive_data(self, client_socket: socket.socket, size: int) -> bytes:
-        """Receive exactly 'size' bytes from the client socket"""
+        """Receive exactly 'size' bytes from the client socket - optimized for speed"""
         data = b''
+
         while len(data) < size:
-            chunk = client_socket.recv(size - len(data))
-            if not chunk:
-                raise ConnectionError("Connection lost while receiving data")
-            data += chunk
+            remaining = size - len(data)
+
+            try:
+                # Use MSG_WAITALL to receive all data in one syscall when possible
+                chunk = client_socket.recv(remaining, socket.MSG_WAITALL)
+                if not chunk:
+                    raise ConnectionError("Connection lost while receiving data")
+                data += chunk
+            except socket.error as e:
+                if e.errno == socket.EAGAIN or e.errno == socket.EWOULDBLOCK:
+                    # No data available yet - this shouldn't happen with MSG_WAITALL but handle it
+                    time.sleep(0.001)  # 1ms sleep
+                    continue
+                else:
+                    raise
+
         return data
 
     def parse_raw_data(self, client_socket: socket.socket) -> bytes:
@@ -629,25 +645,24 @@ class GeneralTCPServer:
     def process_data(self, data: Any, frame_count: int, client_address: tuple) -> None:
         """Process received data - override this method for custom processing"""
         if self.data_mode == DataMode.RAW:
-            self.log(f"Frame {frame_count}: Received {len(data)} raw bytes from {client_address}")
-            if self.verbose and len(data) > 0:
-                # Show first 32 bytes as hex
-                hex_data = ' '.join(f'{b:02x}' for b in data[:32])
-                self.log(f"  First 32 bytes: {hex_data}")
+            if self.verbose:
+                self.log(f"Frame {frame_count}: Received {len(data)} raw bytes from {client_address}")
 
         elif self.data_mode == DataMode.STRUCTURED:
-            self.log(f"Frame {frame_count}: Received structured data from {client_address}")
-            self.log(f"  Header: {data['header']}")
-            self.log(f"  Data count: {data['count']}")
-            if data['count'] > 0:
-                self.log(f"  First few data elements: {data['data'][:min(10, len(data['data']))]}")
+            if self.verbose:
+                self.log(f"Frame {frame_count}: Received structured data from {client_address}")
+                self.log(f"  Header: {data['header']}")
+                self.log(f"  Data count: {data['count']}")
 
         elif self.data_mode == DataMode.JSON:
-            self.log(f"Frame {frame_count}: Received JSON data from {client_address}")
-            self.log(f"  Data: {json.dumps(data, indent=2)}")
+            if self.verbose:
+                self.log(f"Frame {frame_count}: Received JSON data from {client_address}")
 
         else:
-            self.log(f"Frame {frame_count}: Received custom data from {client_address}: {data}")
+            # For radar mode, only log summary data to avoid output flooding
+            if self.verbose and isinstance(data, dict) and 'num_objects' in data:
+                if frame_count % 100 == 0:  # Only every 100 frames
+                    self.log(f"Frame {frame_count}: {data.get('num_objects', 0)} radar objects from {client_address}")
 
     def handle_client(self, client_socket: socket.socket, client_address: tuple):
         """Handle data from a connected client"""
@@ -655,10 +670,55 @@ class GeneralTCPServer:
 
         try:
             frame_count = 0
+            last_frame_time = time.time()
+            frame_times = []
+
             while self.running:
                 try:
+                    frame_start_time = time.time()
                     data = self.parse_data(client_socket)
+                    parse_end_time = time.time()
+
+                    # Calculate frame gap (time since last frame)
+                    frame_gap_ms = (frame_start_time - last_frame_time) * 1000
+                    frame_times.append(frame_gap_ms)
+
+                    # Process data
                     self.process_data(data, frame_count, client_address)
+                    process_end_time = time.time()
+
+                    # Log frame timing periodically
+                    if self.verbose and frame_count % 100 == 0 and frame_count > 0:
+                        avg_gap = sum(frame_times[-100:]) / len(frame_times[-100:])
+                        max_gap = max(frame_times[-100:]) if frame_times[-100:] else 0
+                        parse_time = (parse_end_time - frame_start_time) * 1000
+                        process_time = (process_end_time - parse_end_time) * 1000
+
+                        # Check socket buffer usage
+                        try:
+                            import fcntl
+                            import struct as sock_struct
+                            FIONREAD = 0x541B
+                            bytes_available = sock_struct.unpack('I', fcntl.ioctl(client_socket.fileno(), FIONREAD, sock_struct.pack('I', 0)))[0]
+                            buffer_info = f", SocketBuf={bytes_available}B"
+                        except:
+                            buffer_info = ""
+
+                        self.log(f"📊 Frame timing: Gap={avg_gap:.1f}ms avg/{max_gap:.1f}ms max, "
+                                f"Parse={parse_time:.1f}ms, Process={process_time:.1f}ms{buffer_info}")
+
+                        # Detect potential frame drops
+                        if max_gap > 200:  # More than 200ms gap suggests dropped frames
+                            self.log(f"⚠️ POTENTIAL FRAME DROPS: Max gap {max_gap:.1f}ms (expected ~50ms for 20Hz)")
+
+                        # Log detailed timing from radar parser if available
+                        if isinstance(data, dict) and 'timing' in data:
+                            timing = data['timing']
+                            self.log(f"🔬 Parse breakdown: Header={timing.get('header_receive_ms', 0):.1f}ms, "
+                                    f"Doppler={timing.get('doppler_receive_ms', 0):.1f}ms, "
+                                    f"Matrix={timing.get('matrix_build_ms', 0):.1f}ms")
+
+                    last_frame_time = frame_start_time
                     frame_count += 1
 
                 except socket.timeout:
@@ -696,7 +756,11 @@ class GeneralTCPServer:
             while self.running:
                 try:
                     client_socket, client_address = self.server_socket.accept()
-                    client_socket.settimeout(self.timeout)
+                    client_socket.settimeout(0.01)  # 10ms timeout instead of 1000ms
+
+                    # Optimize socket buffers for high-throughput radar data
+                    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)  # 1MB receive buffer
+                    client_socket.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
 
                     # Handle each client in a separate thread
                     client_thread = threading.Thread(
@@ -775,8 +839,14 @@ def get_gps_timestamp(rover_data):
 def create_radar_parser(server_instance):
     """Create a custom parser for radar data (like the original new_tcpserver.py)"""
     def radar_parser(client_socket):
+        parse_start_time = time.time()
+        timing_data = {}
+
         # Receive header: numObj (uint32_t) + dummy (uint16_t)
+        t_start = time.time()
         header_data = server_instance.receive_data(client_socket, 6)  # 4 + 2 bytes
+        timing_data['header_receive_ms'] = (time.time() - t_start) * 1000
+
         num_obj, dummy = struct.unpack('<IH', header_data)
 
         # Validate header: check if num_obj is reasonable for radar data
@@ -786,16 +856,22 @@ def create_radar_parser(server_instance):
             return {"num_objects": 0, "objects": [], "skipped": True, "reason": f"num_objects {num_obj} too large"}
 
         if num_obj == 0:
-            return {"num_objects": 0, "objects": []}
+            return {"num_objects": 0, "objects": [], "timing": timing_data}
 
         # Receive point cloud data
+        t_start = time.time()
         pointcloud_size = 24 * num_obj  # 24 bytes per object
         pointcloud_data = server_instance.receive_data(client_socket, pointcloud_size)
+        timing_data['pointcloud_receive_ms'] = (time.time() - t_start) * 1000
 
         # Parse point cloud data
+        t_start = time.time()
         pointcloud_format = '<' + 'ffffii' * num_obj
         pointcloud = struct.unpack(pointcloud_format, pointcloud_data)
+        timing_data['pointcloud_parse_ms'] = (time.time() - t_start) * 1000
 
+        # Build objects list
+        t_start = time.time()
         objects = []
         for i in range(num_obj):
             obj = {
@@ -807,23 +883,33 @@ def create_radar_parser(server_instance):
                 'doppler_idx': pointcloud[i*6 + 5]
             }
             objects.append(obj)
+        timing_data['objects_build_ms'] = (time.time() - t_start) * 1000
 
         # Receive configuration data (following full_doppler_tcpserver.py format)
+        t_start = time.time()
         doppler_bins_header = server_instance.receive_data(client_socket, 2)
         num_doppler_bins = struct.unpack('<H', doppler_bins_header)[0]
 
         # Receive number of range bins per object
         range_bins_header = server_instance.receive_data(client_socket, 2)
         num_range_bins_per_obj = struct.unpack('<H', range_bins_header)[0]
+        timing_data['config_receive_ms'] = (time.time() - t_start) * 1000
 
         # Receive Doppler bin data for all range bins of all objects
+        t_start = time.time()
         doppler_data_size = num_obj * num_range_bins_per_obj * num_doppler_bins * 2  # uint16_t = 2 bytes
         doppler_data = server_instance.receive_data(client_socket, doppler_data_size)
+        timing_data['doppler_receive_ms'] = (time.time() - t_start) * 1000
+        timing_data['doppler_data_size_kb'] = doppler_data_size / 1024
 
         # Parse doppler data
-        doppler_values = struct.unpack('<' + 'H' * (num_obj * num_range_bins_per_obj * num_doppler_bins), doppler_data)
+        t_start = time.time()
+        doppler_format = '<' + 'H' * (num_obj * num_range_bins_per_obj * num_doppler_bins)
+        doppler_values = struct.unpack(doppler_format, doppler_data)
+        timing_data['doppler_parse_ms'] = (time.time() - t_start) * 1000
 
         # Add range-doppler data to each object (2D matrix format matching expected output)
+        t_start = time.time()
         for i, obj in enumerate(objects):
             range_idx = obj['range_idx']
             doppler_idx = obj['doppler_idx']
@@ -849,12 +935,14 @@ def create_radar_parser(server_instance):
                 'range_window_start': range_window_start,
                 'matrix': matrix
             }
+        timing_data['matrix_build_ms'] = (time.time() - t_start) * 1000
 
-        # Log successful parse
-        if server_instance.verbose:
-            server_instance.log(f"Successfully parsed radar data: {num_obj} objects, {num_doppler_bins} doppler bins, {num_range_bins_per_obj} range bins per object")
+        # Calculate total parse time
+        timing_data['total_parse_ms'] = (time.time() - parse_start_time) * 1000
 
-        return {"num_objects": num_obj, "objects": objects}
+        # Store timing data for main handler to log (avoid verbose output here)
+
+        return {"num_objects": num_obj, "objects": objects, "timing": timing_data}
 
     return radar_parser
 
@@ -893,6 +981,8 @@ def main():
     parser.add_argument('--log-path', default='data', help='Data logging base path (default: data)')
     parser.add_argument('--max-file-size', type=int, default=100, help='Max file size in MB (default: 100)')
     parser.add_argument('--log-buffer-size', type=int, default=100, help='Logging buffer size (default: 100)')
+    parser.add_argument('--memory-mode', action='store_true', help='Use in-memory logging (store all data in RAM until shutdown)')
+    parser.add_argument('--memory-limit', type=float, default=60.0, help='Memory limit in GB for in-memory mode (default: 60.0)')
 
     args = parser.parse_args()
 
@@ -913,9 +1003,14 @@ def main():
     else:
         print("   ✅ GPS Setup           : ENABLED")
     if args.enable_logging:
-        print(f"   💾 Data Logging        : ENABLED → {args.log_path}")
-        print(f"   📁 Max File Size       : {args.max_file_size} MB")
-        print(f"   🔄 Buffer Size         : {args.log_buffer_size} records")
+        if args.memory_mode:
+            print(f"   🧠 Data Logging        : MEMORY MODE → {args.log_path}")
+            print(f"   💾 Memory Limit        : {args.memory_limit} GB")
+            print("   ⚡ Mode               : Store all data in RAM until shutdown")
+        else:
+            print(f"   💾 Data Logging        : DISK MODE → {args.log_path}")
+            print(f"   📁 Max File Size       : {args.max_file_size} MB")
+            print(f"   🔄 Buffer Size         : {args.log_buffer_size} records")
     else:
         print("   ⚠️  Data Logging       : DISABLED")
     print("="*60)
@@ -925,12 +1020,18 @@ def main():
     data_logger = None
     if args.enable_logging:
         print("🔧 Initializing data logger...")
-        data_logger = DataLogger(
-            base_path=Path(args.log_path),
-            max_file_size_mb=args.max_file_size,
-            buffer_size=args.log_buffer_size
-        )
-        print(f"   📁 Session: {data_logger.get_session_path()}")
+        if args.memory_mode:
+            data_logger = InMemoryDataLogger(
+                base_path=Path(args.log_path),
+                memory_limit_gb=args.memory_limit
+            )
+        else:
+            data_logger = DataLogger(
+                base_path=Path(args.log_path),
+                max_file_size_mb=args.max_file_size,
+                buffer_size=args.log_buffer_size
+            )
+            print(f"   📁 Session: {data_logger.get_session_path()}")
         print("   ✅ Data logger ready")
         print()
 
@@ -1045,7 +1146,6 @@ def main():
 
             # Log radar data if DataLogger is enabled and we have radar data (dict with objects)
             if self.data_logger and isinstance(data, dict) and "objects" in data:
-                self.log(f"DEBUG: Logging radar data - {data.get('num_objects', 0)} objects")
 
                 # Store radar timing configuration in session metadata on first frame
                 if frame_count == 0 and self.radar_config:
@@ -1085,7 +1185,12 @@ def main():
                     # Convert radar data to bytes for raw storage
                     radar_raw_bytes = json.dumps(data).encode('utf-8')
                     self.data_logger.write_event("radar", frame_capture_timestamp, radar_event, raw_bytes=radar_raw_bytes)
-                    self.log(f"DEBUG: Successfully logged radar event for frame {frame_count}")
+
+                    # Log stats periodically (less frequently to reduce output)
+                    if frame_count % 500 == 0:
+                        stats = self.data_logger.get_stats()
+                        self.log(f"💾 Logged {stats['frames_written']:,} events (drop rate: {stats['drop_rate']:.1f}%)")
+
                 except Exception as e:
                     self.log(f"ERROR: Failed to write radar event to logger: {e}")
                     import traceback
@@ -1097,8 +1202,9 @@ def main():
                     rover_data = self.rover_reader.get_data()
                     if rover_data.lat is not None:
                         enu_coords = convert_gps_to_enu_cm(self.base_coords, rover_data)
-                        self.log(f"  GPS Position (ENU cm): X={enu_coords['x_cm']:.1f}, Y={enu_coords['y_cm']:.1f}, Z={enu_coords['z_cm']:.1f}")
-                        self.log(f"  GPS Position type: {rover_data.pos_type}")
+                        # Only log GPS position periodically to reduce output
+                        if frame_count % 500 == 0:
+                            self.log(f"📡 GPS: X={enu_coords['x_cm']:.1f}cm, Y={enu_coords['y_cm']:.1f}cm, Z={enu_coords['z_cm']:.1f}cm ({rover_data.pos_type})")
 
                         # Log GPS data to DataLogger if enabled
                         if self.data_logger:
@@ -1215,7 +1321,218 @@ def main():
             rover_reader.stop()
         print("👋 Goodbye!")
 
-# --- Data Logging System ---
+# --- In-Memory Data Logging System ---
+class InMemoryDataLogger:
+    """High-performance in-memory data logger that stores all frames in RAM until shutdown"""
+
+    EVENT_TYPES = {
+        "gps": 1,
+        "radar": 2,
+        "system": 3,
+        "worker": 4,
+        "large": 5,
+        "test": 6,
+        "shutdown_test": 7
+    }
+
+    def __init__(self, base_path: Optional[Path] = None, memory_limit_gb: float = 60.0):
+        """
+        Initialize InMemoryDataLogger
+
+        Args:
+            base_path: Base directory for data storage (default: ./data)
+            memory_limit_gb: Memory limit in GB before warnings (default: 60GB for Jetson)
+        """
+        self.base_path = Path(base_path) if base_path else Path("./data")
+        self.memory_limit_bytes = int(memory_limit_gb * 1024 * 1024 * 1024)
+
+        # Create session folder with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_path = self.base_path / f"session_{timestamp}"
+        self.session_path.mkdir(parents=True, exist_ok=True)
+
+        # In-memory storage - simple list for maximum speed
+        self.events = []
+        self.metadata = {}
+
+        # Statistics
+        self.frames_written = 0
+        self.frames_dropped = 0  # Always 0 for memory logger
+        self.last_memory_check = 0
+
+        # Create metadata file
+        self._create_metadata()
+
+        # Setup signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+
+        print(f"🧠 InMemoryDataLogger initialized - storing all data in RAM until shutdown")
+        print(f"   Session: {self.session_path}")
+        print(f"   Memory limit: {memory_limit_gb:.1f} GB")
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful data saving on exit"""
+        def signal_handler(signum, frame):
+            print(f"\n🛑 Received signal {signum} - saving all data to disk...")
+            self.save_to_disk()
+            print("✅ Data saved successfully")
+            exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination
+
+        # For crash recovery (if possible)
+        try:
+            signal.signal(signal.SIGUSR1, signal_handler)  # User signal for manual save
+        except AttributeError:
+            pass  # SIGUSR1 not available on all platforms
+
+    def get_session_path(self) -> Path:
+        """Get the current session path"""
+        return self.session_path
+
+    def write_event(self, event_type: str, timestamp: float, data: Dict[str, Any], raw_bytes: Optional[bytes] = None):
+        """
+        Write an event to memory (ultra-fast, no blocking)
+
+        Args:
+            event_type: Type of event ("gps", "radar", "system", etc.)
+            timestamp: Unix timestamp (seconds since epoch)
+            data: Dictionary of structured data
+            raw_bytes: Optional raw binary data
+        """
+        # Get event type ID
+        event_type_id = self.EVENT_TYPES.get(event_type, 99)  # 99 for unknown
+
+        # Store event in memory - no serialization, just store objects directly
+        event = {
+            'timestamp': timestamp,
+            'event_type_id': event_type_id,
+            'event_type': event_type,
+            'data': data,
+            'raw_bytes': raw_bytes or b''
+        }
+
+        self.events.append(event)
+        self.frames_written += 1
+
+        # Check memory usage periodically (every 1000 frames)
+        if self.frames_written % 1000 == 0:
+            self._check_memory_usage()
+
+    def _check_memory_usage(self):
+        """Check current memory usage and warn if approaching limits"""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)
+            memory_gb = memory_mb / 1024
+
+            # Calculate estimated data size
+            num_events = len(self.events)
+            if num_events > 0:
+                avg_event_size = memory_info.rss / num_events
+                estimated_max_events = self.memory_limit_bytes / avg_event_size
+
+                print(f"🧠 Memory: {memory_gb:.1f} GB, Events: {num_events:,}, Est. max: {int(estimated_max_events):,}")
+
+                # Warning at 80% of limit
+                if memory_info.rss > (self.memory_limit_bytes * 0.8):
+                    print(f"⚠️ WARNING: Memory usage at {memory_gb:.1f} GB ({memory_info.rss/self.memory_limit_bytes*100:.1f}% of limit)")
+                    print(f"   Consider saving data soon - estimated {int(estimated_max_events - num_events):,} events remaining")
+
+                # Critical at 95% of limit
+                if memory_info.rss > (self.memory_limit_bytes * 0.95):
+                    print(f"🚨 CRITICAL: Memory usage at {memory_gb:.1f} GB - forcing garbage collection")
+                    gc.collect()
+
+        except Exception as e:
+            print(f"Warning: Could not check memory usage: {e}")
+
+    def _create_metadata(self):
+        """Create session metadata file"""
+        self.metadata = {
+            "session_id": self.session_path.name,
+            "start_time": datetime.now().isoformat(),
+            "data_format_version": "2.0_inmemory",
+            "event_types": {name: id for name, id in self.EVENT_TYPES.items()},
+            "storage_type": "in_memory_until_shutdown",
+            "record_format": {
+                "timestamp": "double (8 bytes)",
+                "event_type_id": "uint32 (4 bytes)",
+                "data_size": "uint32 (4 bytes)",
+                "json_data": "variable length UTF-8",
+                "raw_size": "uint32 (4 bytes)",
+                "raw_bytes": "variable length binary"
+            }
+        }
+
+    def add_metadata(self, key: str, value: Any):
+        """Add additional metadata"""
+        self.metadata[key] = value
+
+    def get_stats(self):
+        """Get logging statistics"""
+        return {
+            "frames_written": self.frames_written,
+            "frames_dropped": self.frames_dropped,  # Always 0
+            "events_in_memory": len(self.events),
+            "drop_rate": 0.0  # Always 0 for memory logger
+        }
+
+    def save_to_disk(self):
+        """Save all in-memory data to disk with progress indication"""
+        if not self.events:
+            print("No events to save")
+            return
+
+        print(f"💾 Saving {len(self.events):,} events to disk...")
+
+        # Save metadata first
+        metadata_file = self.session_path / "metadata.json"
+        self.metadata["end_time"] = datetime.now().isoformat()
+        self.metadata["total_events"] = len(self.events)
+
+        with open(metadata_file, 'w') as f:
+            json.dump(self.metadata, f, indent=2)
+
+        # Save events in binary format (same as original DataLogger)
+        data_file = self.session_path / "data_000.bin"
+
+        with open(data_file, 'wb') as f:
+            for i, event in enumerate(self.events):
+                # Show progress every 10,000 events
+                if i % 10000 == 0:
+                    progress = (i / len(self.events)) * 100
+                    print(f"   Progress: {progress:.1f}% ({i:,}/{len(self.events):,})")
+
+                # Serialize to same binary format as original DataLogger
+                json_data = json.dumps(event['data']).encode('utf-8')
+                data_size = len(json_data)
+                raw_bytes = event['raw_bytes']
+                raw_size = len(raw_bytes)
+
+                # Pack binary record: timestamp(8) + event_type_id(4) + data_size(4) + json_data + raw_size(4) + raw_bytes
+                record = struct.pack('<dII', event['timestamp'], event['event_type_id'], data_size)
+                record += json_data
+                record += struct.pack('<I', raw_size)
+                record += raw_bytes
+
+                f.write(record)
+
+        print(f"✅ Saved {len(self.events):,} events to {data_file}")
+        print(f"📁 Session data: {self.session_path}")
+
+    def close(self):
+        """Save all data and close logger"""
+        print("💾 Closing InMemoryDataLogger - saving all data...")
+        self.save_to_disk()
+
+    def force_save(self):
+        """Manually trigger save to disk (for testing or periodic saves)"""
+        self.save_to_disk()
+
+# --- Original DataLogger (kept for compatibility) ---
 class DataLogger:
     """Unified high-performance data logger for GPS and sensor data"""
 
@@ -1230,7 +1547,7 @@ class DataLogger:
     }
 
     def __init__(self, base_path: Optional[Path] = None, max_file_size_mb: int = 1024,
-                 buffer_size: int = 100, flush_interval_ms: int = 100):
+                 buffer_size: int = 10000, flush_interval_ms: int = 50):
         """
         Initialize DataLogger
 
@@ -1255,10 +1572,12 @@ class DataLogger:
         self.current_file = None
         self.current_file_size = 0
 
-        # Initialize buffering system
-        self.write_queue = queue.Queue()
+        # Initialize buffering system with larger queue
+        self.write_queue = queue.Queue(maxsize=buffer_size * 2)  # 2x buffer for safety
         self.writer_thread = None
         self.running = False
+        self.frames_dropped = 0
+        self.frames_written = 0
 
         # Thread-safe file operations lock
         self.file_lock = threading.Lock()
@@ -1308,14 +1627,15 @@ class DataLogger:
         # Add to write queue (non-blocking)
         try:
             self.write_queue.put_nowait(record)
-
-            # Force flush if buffer is getting full (overflow protection)
-            if self.write_queue.qsize() >= self.buffer_size:
-                self._force_flush()
+            self.frames_written += 1
 
         except queue.Full:
-            # Emergency: write directly to disk if queue is full
-            self._write_record_directly(record)
+            # Drop frame if queue is full - better than blocking radar data
+            self.frames_dropped += 1
+            if self.frames_dropped % 100 == 0:  # Log every 100 drops
+                print(f"⚠️ DataLogger: Dropped {self.frames_dropped} frames (queue full)")
+                print(f"   Queue size: {self.write_queue.qsize()}/{self.write_queue.maxsize}")
+                print(f"   Written: {self.frames_written}, Drop rate: {self.frames_dropped/(self.frames_written+self.frames_dropped)*100:.1f}%")
 
     def _create_metadata(self):
         """Create session metadata file"""
@@ -1377,27 +1697,30 @@ class DataLogger:
         self.writer_thread.start()
 
     def _writer_loop(self):
-        """Background thread that periodically flushes the write queue"""
-        last_flush_time = time.time()
+        """Background thread that continuously flushes the write queue"""
+        batch_size = 50  # Process up to 50 records at once for better throughput
 
         while self.running:
-            current_time = time.time()
-            should_flush = False
+            records_processed = 0
 
-            # Check if it's time for periodic flush
-            if (current_time - last_flush_time) * 1000 >= self.flush_interval_ms:
-                should_flush = True
+            # Process records in batches for better performance
+            while not self.write_queue.empty() and records_processed < batch_size:
+                try:
+                    record = self.write_queue.get_nowait()
+                    self._write_record_directly(record)
+                    records_processed += 1
+                except queue.Empty:
+                    break
 
-            # Check if buffer has records
-            if not self.write_queue.empty():
-                should_flush = True
+            # Flush to disk after batch
+            if records_processed > 0:
+                with self.file_lock:
+                    if self.current_file:
+                        self.current_file.flush()
 
-            if should_flush:
-                self._flush_queue()
-                last_flush_time = current_time
-
-            # Sleep briefly to avoid busy waiting
-            time.sleep(0.01)  # 10ms
+            # Short sleep only if no records processed
+            if records_processed == 0:
+                time.sleep(0.005)  # 5ms when idle
 
     def _flush_queue(self):
         """Flush all pending records from queue to disk"""
@@ -1432,9 +1755,15 @@ class DataLogger:
                 self.current_file.write(record)
                 self.current_file_size += record_size
 
-    def _force_flush(self):
-        """Force immediate flush of the write queue"""
-        self._flush_queue()
+    def get_stats(self):
+        """Get logging statistics"""
+        return {
+            "frames_written": self.frames_written,
+            "frames_dropped": self.frames_dropped,
+            "queue_size": self.write_queue.qsize(),
+            "queue_max": self.write_queue.maxsize,
+            "drop_rate": self.frames_dropped/(self.frames_written+self.frames_dropped)*100 if (self.frames_written+self.frames_dropped) > 0 else 0
+        }
 
     def close(self):
         """Close the data logger and flush all data"""
