@@ -392,6 +392,108 @@ class UM980Reader:
     def get_data(self) -> "UM980Reader.GPSData":
         return self.rover_data
 
+def load_calibration_offset():
+    """Load calibration offset from config file"""
+    try:
+        with open('radar_alignment_config.json', 'r') as f:
+            config = json.load(f)
+        return config.get('calibration_offset_meters', 0.0), config.get('boresight_direction', 'east')
+    except FileNotFoundError:
+        return 0.0, 'east'  # Default: no additional calibration offset, assume east direction
+
+def apply_base_station_offset(base_coords, total_offset_meters, boresight_direction='east'):
+    """
+    Apply forward offset to base station coordinates along radar boresight direction
+
+    Args:
+        base_coords: GPSData object with original coordinates
+        total_offset_meters: 30cm (physical) + calibration offset
+        boresight_direction: Direction of radar boresight ('east', 'north', or 'up')
+
+    Returns:
+        GPSData object with offset coordinates
+    """
+    try:
+        # Convert to ECEF
+        ecef_transformer = ProjTransformer.from_crs("EPSG:4979", "EPSG:4978", always_xy=True)
+        base_x, base_y, base_z = ecef_transformer.transform(
+            base_coords.lon, base_coords.lat, base_coords.height
+        )
+
+        # Get ENU transformation matrix
+        enu_matrix = ecef2enu(lat=base_coords.lat, lon=base_coords.lon)
+
+        # Apply offset in specified direction (determined from base->rover vector)
+        if boresight_direction.lower() == 'east':
+            offset_vector_enu = np.array([total_offset_meters, 0, 0])  # [East, North, Up]
+        elif boresight_direction.lower() == 'west':
+            offset_vector_enu = np.array([-total_offset_meters, 0, 0])  # [East, North, Up]
+        elif boresight_direction.lower() == 'north':
+            offset_vector_enu = np.array([0, total_offset_meters, 0])  # [East, North, Up]
+        elif boresight_direction.lower() == 'south':
+            offset_vector_enu = np.array([0, -total_offset_meters, 0])  # [East, North, Up]
+        elif boresight_direction.lower() == 'up':
+            offset_vector_enu = np.array([0, 0, total_offset_meters])  # [East, North, Up]
+        else:
+            print(f"Warning: Unknown boresight direction '{boresight_direction}', defaulting to east")
+            offset_vector_enu = np.array([total_offset_meters, 0, 0])
+
+        offset_vector_ecef = enu_matrix.T.dot(offset_vector_enu)
+
+        # Apply offset in ECEF
+        new_ecef = np.array([base_x, base_y, base_z]) + offset_vector_ecef
+
+        # Convert back to LLA
+        lla_transformer = ProjTransformer.from_crs("EPSG:4978", "EPSG:4979", always_xy=True)
+        new_lon, new_lat, new_height = lla_transformer.transform(
+            new_ecef[0], new_ecef[1], new_ecef[2]
+        )
+
+        # Create offset coordinates
+        offset_coords = UM980Reader.GPSData()
+        offset_coords.lat = new_lat
+        offset_coords.lon = new_lon
+        offset_coords.height = new_height
+        offset_coords.pos_type = base_coords.pos_type
+        offset_coords.undulation = base_coords.undulation
+
+        return offset_coords
+
+    except Exception as e:
+        print(f"ERROR: Failed to apply base station offset: {e}")
+        return base_coords  # Return original coordinates if offset fails
+
+def store_base_station_metadata(original_coords, offset_coords, total_offset, boresight_direction):
+    """Store base station coordinate metadata for debugging and verification"""
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "original_coordinates": {
+            "latitude": float(original_coords.lat),
+            "longitude": float(original_coords.lon),
+            "height": float(original_coords.height),
+            "position_type": str(original_coords.pos_type)
+        },
+        "offset_coordinates": {
+            "latitude": float(offset_coords.lat),
+            "longitude": float(offset_coords.lon),
+            "height": float(offset_coords.height),
+            "position_type": str(offset_coords.pos_type)
+        },
+        "offset_parameters": {
+            "total_offset_meters": float(total_offset),
+            "boresight_direction": str(boresight_direction),
+            "physical_offset_meters": 0.30,
+            "calibration_offset_meters": float(total_offset - 0.30)
+        }
+    }
+
+    try:
+        with open('base_station_coordinates.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"📝 Base station metadata saved to base_station_coordinates.json")
+    except Exception as e:
+        print(f"Warning: Could not save base station metadata: {e}")
+
 def get_base_station_coords(port, baudrate=115200):
     """
     Gets base station coordinates using ASCII protocol (BESTNAVA messages).
@@ -422,8 +524,25 @@ def get_base_station_coords(port, baudrate=115200):
                     if pos_type in ['NARROW_INT', 'WIDE_INT', 'L1_FLOAT', 'IONOFREE_FLOAT', 'SINGLE', 'FIXEDPOS']:
                         print(f"\n✅ Base station coordinates acquired: ({base_data.lat:.6f}, {base_data.lon:.6f}, {base_data.height:.2f})")
                         print(f"✅ Position type: {pos_type}")
+
+                        # Load offset configuration
+                        PHYSICAL_OFFSET_M = 0.30  # 30cm physical separation
+                        calibration_offset, boresight_direction = load_calibration_offset()
+                        total_offset = PHYSICAL_OFFSET_M + calibration_offset
+
+                        print(f"📐 Applying base station offset: {total_offset:.3f}m in {boresight_direction} direction")
+                        print(f"   Physical offset: {PHYSICAL_OFFSET_M:.2f}m, Calibration: {calibration_offset:.3f}m")
+
+                        # Apply offset
+                        original_coords = base_data
+                        offset_coords = apply_base_station_offset(original_coords, total_offset, boresight_direction)
+
+                        # Store both in metadata for debugging
+                        store_base_station_metadata(original_coords, offset_coords, total_offset, boresight_direction)
+
+                        print(f"✅ Offset coordinates: ({offset_coords.lat:.6f}, {offset_coords.lon:.6f}, {offset_coords.height:.2f})")
                         base_reader.stop()
-                        return base_data  # Return GPSData object directly
+                        return offset_coords  # Return offset coordinates for all downstream processing
 
                 time.sleep(0.5)  # Shorter sleep for better responsiveness
                 attempts += 1
@@ -493,9 +612,8 @@ def convert_gps_to_enu_cm(base_coords, rover_data, transformer=None):
         # Apply transformation
         enu_coords = enu_matrix.dot(diff_ecef)
 
-        # Flip only the North/South axis to align GPS with radar coordinate system
-        # GPS South becomes North in the radar reference frame
-        enu_coords[1] = -enu_coords[1]  # Flip North/South only
+        # Legacy coordinate flip removed - using standard ENU coordinates
+        # The base station offset system handles coordinate alignment
 
         return {"x_cm": enu_coords[0] * 100, "y_cm": enu_coords[1] * 100, "z_cm": enu_coords[2] * 100}
 
@@ -553,28 +671,110 @@ class GeneralTCPServer:
             timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
             print(f"[{timestamp}] {message}")
 
-    def receive_data(self, client_socket: socket.socket, size: int) -> bytes:
-        """Receive exactly 'size' bytes from the client socket - optimized for speed"""
+    def receive_data(self, client_socket: socket.socket, size: int, timeout_seconds: float = 2.0) -> bytes:
+        """Receive exactly 'size' bytes from the client socket with timeout handling"""
         data = b''
+        original_timeout = client_socket.gettimeout()
 
-        while len(data) < size:
-            remaining = size - len(data)
+        try:
+            # Set socket timeout for radar connection issues
+            client_socket.settimeout(timeout_seconds)
 
-            try:
-                # Use MSG_WAITALL to receive all data in one syscall when possible
-                chunk = client_socket.recv(remaining, socket.MSG_WAITALL)
-                if not chunk:
-                    raise ConnectionError("Connection lost while receiving data")
-                data += chunk
-            except socket.error as e:
-                if e.errno == socket.EAGAIN or e.errno == socket.EWOULDBLOCK:
-                    # No data available yet - this shouldn't happen with MSG_WAITALL but handle it
-                    time.sleep(0.001)  # 1ms sleep
-                    continue
-                else:
-                    raise
+            while len(data) < size:
+                remaining = size - len(data)
 
-        return data
+                try:
+                    # Use MSG_WAITALL to receive all data in one syscall when possible
+                    chunk = client_socket.recv(remaining, socket.MSG_WAITALL)
+                    if not chunk:
+                        raise ConnectionError("Connection lost while receiving data")
+                    data += chunk
+                except socket.timeout:
+                    raise socket.timeout("Socket timeout waiting for radar data")
+                except socket.error as e:
+                    if e.errno == socket.EAGAIN or e.errno == socket.EWOULDBLOCK:
+                        # No data available yet - this shouldn't happen with MSG_WAITALL but handle it
+                        time.sleep(0.001)  # 1ms sleep
+                        continue
+                    else:
+                        raise
+
+            return data
+
+        finally:
+            # Restore original timeout
+            client_socket.settimeout(original_timeout)
+
+    def attempt_radar_resync(self, client_socket: socket.socket, max_search_bytes: int = 1024) -> tuple:
+        """
+        Attempt to resynchronize radar data stream by searching for valid frame patterns
+
+        Args:
+            client_socket: The client socket to read from
+            max_search_bytes: Maximum bytes to search for sync pattern
+
+        Returns:
+            tuple: (success: bool, header_data: bytes or None, num_obj: int, dummy: int)
+        """
+        if self.verbose:
+            self.log("🔍 Searching for radar frame sync pattern...")
+
+        search_buffer = b''
+
+        try:
+            # Set short timeout for resync operations
+            original_timeout = client_socket.gettimeout()
+            client_socket.settimeout(0.5)  # 500ms timeout for resync
+
+            # Read bytes one at a time looking for valid patterns
+            for i in range(max_search_bytes):
+                try:
+                    byte_data = client_socket.recv(1)
+                    if not byte_data:
+                        break
+                except socket.timeout:
+                    if self.verbose:
+                        self.log("⏰ Resync timeout - radar may be disconnected")
+                    return (False, None, 0, 0)
+
+                search_buffer += byte_data
+
+                # Only check patterns when we have enough bytes for a header
+                if len(search_buffer) >= 6:
+                    # Try parsing as radar header from different positions
+                    for start_pos in range(len(search_buffer) - 5):
+                        try:
+                            header_candidate = search_buffer[start_pos:start_pos + 6]
+                            num_obj, dummy = struct.unpack('<IH', header_candidate)
+
+                            # Check if this looks like a valid radar header
+                            if 0 <= num_obj <= 1000:  # Reasonable object count
+                                if self.verbose:
+                                    hex_bytes = header_candidate.hex()
+                                    self.log(f"✅ Found sync pattern at offset {start_pos}: num_objects={num_obj}, raw: {hex_bytes}")
+
+                                # Return the valid header data
+                                return (True, header_candidate, num_obj, dummy)
+
+                        except struct.error:
+                            continue  # Try next position
+
+                # Limit buffer size to prevent memory issues
+                if len(search_buffer) > 64:
+                    search_buffer = search_buffer[-32:]  # Keep last 32 bytes
+
+            if self.verbose:
+                self.log(f"❌ No sync pattern found in {max_search_bytes} bytes")
+            return (False, None, 0, 0)
+
+        except Exception as e:
+            if self.verbose:
+                self.log(f"❌ Resync error: {e}")
+            return (False, None, 0, 0)
+        finally:
+            # Restore original timeout
+            if 'original_timeout' in locals():
+                client_socket.settimeout(original_timeout)
 
     def parse_raw_data(self, client_socket: socket.socket) -> bytes:
         """Parse raw data - just receive buffer_size bytes"""
@@ -837,23 +1037,100 @@ def get_gps_timestamp(rover_data):
     return None
 
 def create_radar_parser(server_instance):
-    """Create a custom parser for radar data (like the original new_tcpserver.py)"""
+    """Create a custom parser for radar data with synchronization recovery"""
     def radar_parser(client_socket):
         parse_start_time = time.time()
         timing_data = {}
 
-        # Receive header: numObj (uint32_t) + dummy (uint16_t)
-        t_start = time.time()
-        header_data = server_instance.receive_data(client_socket, 6)  # 4 + 2 bytes
-        timing_data['header_receive_ms'] = (time.time() - t_start) * 1000
+        # Try to receive and validate header with recovery mechanism
+        max_resync_attempts = 3
+        for attempt in range(max_resync_attempts):
+            t_start = time.time()
 
-        num_obj, dummy = struct.unpack('<IH', header_data)
+            try:
+                # Receive header: numObj (uint32_t) + dummy (uint16_t)
+                header_data = server_instance.receive_data(client_socket, 6)  # 4 + 2 bytes
+                timing_data['header_receive_ms'] = (time.time() - t_start) * 1000
 
-        # Validate header: check if num_obj is reasonable for radar data
-        if num_obj > 1000:  # Unreasonably large number of objects
-            if server_instance.verbose:
-                server_instance.log(f"Skipping invalid radar message: num_objects={num_obj} (too large)")
-            return {"num_objects": 0, "objects": [], "skipped": True, "reason": f"num_objects {num_obj} too large"}
+                num_obj, dummy = struct.unpack('<IH', header_data)
+
+                # Validate header: check if num_obj is reasonable for radar data
+                if num_obj <= 1000 and num_obj >= 0:  # Valid range
+                    break  # Good header found
+
+                # Invalid header - attempt recovery
+                if server_instance.verbose and attempt == 0:
+                    hex_bytes = header_data.hex()
+                    frame_num = getattr(server_instance, 'frame_count', '?')
+                    server_instance.log(f"🔄 Attempting resync: num_objects={num_obj}, raw: {hex_bytes}")
+
+                # Try to resync by reading bytes one at a time looking for valid pattern
+                if attempt < max_resync_attempts - 1:
+                    resync_success, sync_header_data, sync_num_obj, sync_dummy = server_instance.attempt_radar_resync(client_socket)
+                    if resync_success:
+                        # Use the synchronized header data
+                        header_data = sync_header_data
+                        num_obj = sync_num_obj
+                        dummy = sync_dummy
+                        if server_instance.verbose:
+                            server_instance.log(f"✅ Resync successful on attempt {attempt + 1}")
+                        break
+                    else:
+                        continue  # Try next attempt
+                else:
+                    # Final attempt failed
+                    if not hasattr(server_instance, 'invalid_msg_count'):
+                        server_instance.invalid_msg_count = 0
+                        server_instance.last_invalid_log = 0
+
+                    server_instance.invalid_msg_count += 1
+                    current_time = time.time()
+
+                    # Rate limit error messages
+                    if (server_instance.invalid_msg_count % 50 == 1 or
+                        current_time - server_instance.last_invalid_log > 5.0):
+
+                        if server_instance.verbose:
+                            hex_bytes = header_data.hex()
+                            frame_num = getattr(server_instance, 'frame_count', '?')
+                            server_instance.log(f"❌ Resync failed after {max_resync_attempts} attempts")
+                            server_instance.log(f"   Latest: num_objects={num_obj} (frame {frame_num})")
+                            server_instance.log(f"   Raw bytes: {hex_bytes}")
+
+                        server_instance.last_invalid_log = current_time
+
+                    return {"num_objects": 0, "objects": [], "skipped": True, "reason": f"resync failed, num_objects {num_obj}"}
+
+            except socket.timeout as e:
+                # Rate limit timeout messages
+                if not hasattr(server_instance, 'timeout_msg_count'):
+                    server_instance.timeout_msg_count = 0
+                    server_instance.last_timeout_log = 0
+
+                server_instance.timeout_msg_count += 1
+                current_time = time.time()
+
+                # Log timeout only every 10 timeouts OR every 10 seconds
+                if (server_instance.timeout_msg_count % 10 == 1 or
+                    current_time - server_instance.last_timeout_log > 10.0):
+                    if server_instance.verbose:
+                        server_instance.log(f"⏰ Radar timeout #{server_instance.timeout_msg_count}: Check radar connection")
+                    server_instance.last_timeout_log = current_time
+
+                if attempt == max_resync_attempts - 1:
+                    return {"num_objects": 0, "objects": [], "skipped": True, "reason": "radar timeout - check connection"}
+                time.sleep(0.1)  # Brief pause before retry
+                continue
+            except ConnectionError as e:
+                if server_instance.verbose:
+                    server_instance.log(f"🔌 Radar disconnected on attempt {attempt + 1}: {e}")
+                return {"num_objects": 0, "objects": [], "skipped": True, "reason": "radar disconnected"}
+            except Exception as e:
+                if server_instance.verbose:
+                    server_instance.log(f"🔄 Header read error on attempt {attempt + 1}: {e}")
+                if attempt == max_resync_attempts - 1:
+                    return {"num_objects": 0, "objects": [], "skipped": True, "reason": f"header read failed: {e}"}
+                continue
 
         if num_obj == 0:
             return {"num_objects": 0, "objects": [], "timing": timing_data}
@@ -975,6 +1252,8 @@ def main():
                        help='Struct format for data elements in structured mode (default: <f)')
     parser.add_argument('--quiet', action='store_true', help='Disable verbose logging')
     parser.add_argument('--skip-gps', action='store_true', help='Skip GPS setup and go straight to TCP server')
+    parser.add_argument('--calibrate-boresight', action='store_true', help='Run boresight direction calibration mode')
+    parser.add_argument('--skip-calibration', action='store_true', help='Skip automatic coordinate system calibration and use existing config')
 
     # Data logging arguments
     parser.add_argument('--disable-logging', action='store_true', help='Disable data logging to disk')
@@ -985,6 +1264,116 @@ def main():
     parser.add_argument('--memory-limit', type=float, default=60.0, help='Memory limit in GB for in-memory mode (default: 60.0)')
 
     args = parser.parse_args()
+
+    # Handle boresight calibration mode
+    if args.calibrate_boresight:
+        print("🧭 Manual Boresight Calibration Mode")
+        print("This will determine the radar's forward direction for coordinate alignment")
+        from coordinate_alignment_calibration import run_boresight_calibration
+        result = run_boresight_calibration(args.base_port, args.rover_port, args.base_baud)
+        if result:
+            print(f"✅ Calibration complete! Boresight direction: {result}")
+        else:
+            print("❌ Calibration failed")
+        return
+
+    # Check if coordinate system is already calibrated
+    def check_coordinate_calibration():
+        """Check if coordinate system has been calibrated"""
+        try:
+            with open('radar_alignment_config.json', 'r') as f:
+                config = json.load(f)
+
+            # Only consider it calibrated if we have actual calibration data
+            has_proper_calibration = (
+                'calibration_timestamp' in config or
+                'calibration_data' in config or
+                'manual_setup' in config
+            )
+            boresight_direction = config.get('boresight_direction', 'east')
+
+            return has_proper_calibration, boresight_direction
+        except FileNotFoundError:
+            return False, 'east'
+
+    # Always run coordinate system calibration unless explicitly skipped
+    if not args.skip_gps:
+        if args.skip_calibration:
+            # User explicitly wants to skip calibration and use existing config
+            calibrated, current_direction = check_coordinate_calibration()
+            if calibrated:
+                print(f"⚙️ Using existing coordinate system configuration (boresight: {current_direction})")
+                print("   To recalibrate, run without --skip-calibration flag")
+            else:
+                print("⚠️ No calibration data found, but --skip-calibration was used")
+                print("   Creating default configuration with 'east' boresight direction")
+                config = {
+                    "calibration_offset_meters": 0.0,
+                    "physical_offset_meters": 0.30,
+                    "boresight_direction": "east",
+                    "notes": "Default configuration - recommend running calibration",
+                    "default_setup": True,
+                    "setup_timestamp": datetime.now().isoformat()
+                }
+                with open('radar_alignment_config.json', 'w') as f:
+                    json.dump(config, f, indent=2)
+                print("✅ Default configuration created. RECOMMEND running calibration later.")
+        else:
+            # Default behavior: always run calibration
+            print("🧭 COORDINATE SYSTEM CALIBRATION")
+            print("=" * 60)
+            print("Determining which coordinate axis represents the radar's forward direction.")
+            print("This ensures proper alignment between radar detections and GPS coordinates.")
+            print()
+            print("To skip this step in future runs, use: --skip-calibration")
+            print()
+
+            response = input("Run coordinate system calibration now? [Y/n]: ").strip().lower()
+            if response in ['', 'y', 'yes']:
+                print("\n🧭 Starting Coordinate System Calibration...")
+                from coordinate_alignment_calibration import run_boresight_calibration
+                result = run_boresight_calibration(args.base_port, args.rover_port, args.base_baud)
+                if result:
+                    print(f"✅ Calibration complete! Boresight direction: {result}")
+                    print("Continuing with normal system startup...")
+                else:
+                    print("❌ Calibration failed!")
+                    print("This could be due to:")
+                    print("  - GPS connection issues (check port/cable)")
+                    print("  - GPS not getting position fix")
+                    print("  - Hardware problems")
+                    print()
+                    print("OPTIONS:")
+                    print("1. Fix GPS connection and retry: python start_data_collection.py")
+                    print("2. Skip calibration for now: python start_data_collection.py --skip-calibration")
+                    print("3. Skip GPS entirely: python start_data_collection.py --skip-gps")
+                    print()
+                    print("❌ CANNOT CONTINUE without coordinate system setup.")
+                    print("   System startup aborted.")
+                    return
+            else:
+                print("⚠️ Coordinate system calibration is HIGHLY RECOMMENDED for proper operation.")
+                print("Without calibration, radar and GPS coordinates may not align correctly.")
+                print()
+                manual_direction = input("Manually specify boresight direction [east/north/up] or 'abort': ").strip().lower()
+
+                if manual_direction in ['east', 'north', 'up']:
+                    # Create basic config with manual direction
+                    config = {
+                        "calibration_offset_meters": 0.0,
+                        "physical_offset_meters": 0.30,
+                        "boresight_direction": manual_direction,
+                        "notes": f"Manual configuration - boresight set to {manual_direction}",
+                        "manual_setup": True,
+                        "setup_timestamp": datetime.now().isoformat()
+                    }
+                    with open('radar_alignment_config.json', 'w') as f:
+                        json.dump(config, f, indent=2)
+                    print(f"✅ Manual configuration saved: boresight = {manual_direction}")
+                    print("⚠️ RECOMMEND running proper calibration later for accuracy")
+                else:
+                    print("❌ System startup aborted. Coordinate system setup required.")
+                    return
 
     # Enable logging by default unless explicitly disabled
     args.enable_logging = not args.disable_logging
@@ -1147,15 +1536,28 @@ def main():
             # Log radar data if DataLogger is enabled and we have radar data (dict with objects)
             if self.data_logger and isinstance(data, dict) and "objects" in data:
 
-                # Store radar timing configuration in session metadata on first frame
-                if frame_count == 0 and self.radar_config:
-                    timing_metadata = {
-                        "radar_timing": self.radar_config,
-                        "timestamp_method": "gps_synchronized_frame_estimation",
-                        "gps_leap_seconds_offset": 18,
-                        "frame_timing_note": "Timestamps estimated using GPS time + frame_count * frame_period"
-                    }
-                    self.data_logger.add_metadata("radar_timing_configuration", timing_metadata)
+                # Store radar timing configuration and base station metadata on first frame
+                if frame_count == 0:
+                    if self.radar_config:
+                        timing_metadata = {
+                            "radar_timing": self.radar_config,
+                            "timestamp_method": "gps_synchronized_frame_estimation",
+                            "gps_leap_seconds_offset": 18,
+                            "frame_timing_note": "Timestamps estimated using GPS time + frame_count * frame_period"
+                        }
+                        self.data_logger.add_metadata("radar_timing_configuration", timing_metadata)
+
+                    # Add base station coordinate metadata to session
+                    if self.base_coords:
+                        try:
+                            with open('base_station_coordinates.json', 'r') as f:
+                                base_station_metadata = json.load(f)
+                            self.data_logger.add_metadata("base_station_coordinates", base_station_metadata)
+                            self.log("📝 Base station coordinate metadata added to session")
+                        except FileNotFoundError:
+                            self.log("Warning: base_station_coordinates.json not found")
+                        except Exception as e:
+                            self.log(f"Warning: Could not load base station metadata: {e}")
 
                 # Store radar configuration in session metadata if available
                 if data.get("objects") and len(data["objects"]) > 0:

@@ -23,6 +23,9 @@ class Radar3DVisualizer:
         self.frames = None
         self.current_frame = 0
 
+        # Load radar boresight configuration
+        self.boresight_direction = self._load_boresight_config()
+
         # Visualization settings
         self.fig = None
         self.ax = None
@@ -33,6 +36,61 @@ class Radar3DVisualizer:
 
         # Load and validate data
         self.load_data()
+
+    def _load_boresight_config(self):
+        """Load radar boresight direction from configuration file"""
+        try:
+            with open('radar_alignment_config.json', 'r') as f:
+                config = json.load(f)
+            direction = config.get('boresight_direction', 'east')
+            print(f"📡 Loaded radar boresight direction: {direction}")
+            return direction
+        except FileNotFoundError:
+            print("⚠️ No radar alignment config found, assuming east boresight")
+            return 'east'
+        except Exception as e:
+            print(f"⚠️ Error loading radar config: {e}, assuming east boresight")
+            return 'east'
+
+    def transform_radar_to_gps_coordinates(self, radar_x, radar_y, radar_z):
+        """
+        Transform radar coordinates to GPS coordinates based on boresight direction
+
+        AWR2944P radar coordinate system:
+        - Radar -Y axis = boresight (forward from antenna)
+        - Need to transform to GPS ENU coordinates (East-North-Up)
+        """
+        # Default transformation (assuming radar axes = GPS axes)
+        gps_x, gps_y, gps_z = radar_x, radar_y, radar_z
+
+        if self.boresight_direction == 'south':
+            # Radar -Y points south, so:
+            # Radar +X → GPS +X (East)
+            # Radar +Y → GPS +Y (North)
+            # Radar -Y → GPS -Y (South) - this is boresight
+            gps_x = radar_x      # Radar X → GPS East
+            gps_y = -radar_y     # Flip Y: Radar +Y → GPS -Y (Radar -Y = South)
+            gps_z = radar_z      # Radar Z → GPS Up
+
+        elif self.boresight_direction == 'north':
+            # Radar -Y points north, so:
+            gps_x = radar_x      # Radar X → GPS East
+            gps_y = radar_y      # Radar Y → GPS North (no flip needed)
+            gps_z = radar_z      # Radar Z → GPS Up
+
+        elif self.boresight_direction == 'east':
+            # Radar -Y points east, so:
+            gps_x = -radar_y     # Radar -Y → GPS +X (East)
+            gps_y = radar_x      # Radar X → GPS North
+            gps_z = radar_z      # Radar Z → GPS Up
+
+        elif self.boresight_direction == 'west':
+            # Radar -Y points west, so:
+            gps_x = radar_y      # Radar Y → GPS East
+            gps_y = radar_x      # Radar X → GPS North
+            gps_z = radar_z      # Radar Z → GPS Up
+
+        return gps_x, gps_y, gps_z
 
     def load_data(self):
         """Load and parse the JSON data file"""
@@ -68,15 +126,22 @@ class Radar3DVisualizer:
 
         frame = self.frames[frame_idx]
 
-        # Extract radar objects
+        # Extract radar objects and transform coordinates
         radar_objects = []
         if 'objects' in frame and frame['objects']:
             for obj in frame['objects']:
+                # Transform radar coordinates to GPS coordinates
+                gps_x, gps_y, gps_z = self.transform_radar_to_gps_coordinates(
+                    obj['x'], obj['y'], obj['z']
+                )
                 radar_objects.append({
-                    'x': obj['x'],
-                    'y': obj['y'],
-                    'z': obj['z'],
-                    'velocity': obj.get('velocity', 0)
+                    'x': gps_x,
+                    'y': gps_y,
+                    'z': gps_z,
+                    'velocity': obj.get('velocity', 0),
+                    'original_x': obj['x'],  # Keep original for debugging
+                    'original_y': obj['y'],
+                    'original_z': obj['z']
                 })
 
         # Extract GPS position
